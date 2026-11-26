@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fork 快照的 COW 峰值内存与延迟 · 模拟器</title>
+<style>
+:root{
+  --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#2a3240;
+  --fg:#dbe3ee; --dim:#8b97a8; --accent:#5aa9ff; --warn:#ffb454;
+  --bad:#ff6b6b; --good:#57d38c; --huge:#c792ea;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB",sans-serif}
+header{padding:22px 28px 10px;border-bottom:1px solid var(--line)}
+h1{margin:0 0 6px;font-size:21px;font-weight:600;letter-spacing:.2px}
+h1 small{color:var(--dim);font-weight:400;font-size:13px;margin-left:10px}
+.sub{color:var(--dim);font-size:13px;max-width:980px}
+.wrap{display:grid;grid-template-columns:260px 1fr;min-height:calc(100vh - 92px)}
+nav{border-right:1px solid var(--line);padding:14px 10px;position:sticky;top:0;align-self:start}
+nav button{display:block;width:100%;text-align:left;background:none;border:0;color:var(--dim);
+  padding:8px 12px;border-radius:7px;cursor:pointer;font-size:13.5px;margin-bottom:2px}
+nav button:hover{background:var(--panel)}
+nav button.on{background:var(--panel2);color:var(--fg);box-shadow:inset 2px 0 0 var(--accent)}
+main{padding:20px 28px 60px;min-width:0}
+section{display:none}
+section.on{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:16px}
+.card h2{margin:0 0 4px;font-size:15px;font-weight:600}
+.card p.note{color:var(--dim);font-size:12.5px;margin:0 0 12px}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:1fr 1fr}
+.g3{grid-template-columns:repeat(3,1fr)}
+@media(max-width:1100px){.g2,.g3{grid-template-columns:1fr}}
+.kpi{display:flex;flex-direction:column;gap:2px}
+.kpi .v{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums}
+.kpi .l{color:var(--dim);font-size:12px}
+.kpi .h{font-size:11.5px;color:var(--dim)}
+canvas{width:100%;display:block}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--dim);font-weight:500;position:sticky;top:0;background:var(--panel)}
+tbody tr:hover{background:var(--panel2)}
+.tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px}
+.tag.bad{background:rgba(255,107,107,.14);color:var(--bad)}
+.tag.good{background:rgba(87,211,140,.14);color:var(--good)}
+.tag.warn{background:rgba(255,180,84,.14);color:var(--warn)}
+.controls{display:flex;gap:22px;flex-wrap:wrap;align-items:center;margin-bottom:14px;font-size:12.5px;color:var(--dim)}
+.controls label{display:flex;align-items:center;gap:7px}
+select,input[type=range]{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  border-radius:6px;padding:4px 8px;font-size:12.5px}
+input[type=range]{padding:0;width:150px}
+.hm{display:grid;grid-auto-rows:1fr;gap:1px;margin-top:4px;height:38px;width:100%}
+.hm.head{height:70px;max-width:420px}
+.hm div{border-radius:1px;min-height:0}
+.small{font-size:12px;color:var(--dim)}
+code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+.bar{height:6px;border-radius:3px;background:var(--panel2);overflow:hidden}
+.bar>span{display:block;height:100%}
+</style>
+</head>
+<body>
+<header>
+  <h1>fork 快照的 COW 峰值内存与请求延迟 <small>页级模拟器 · 真机实测校准</small></h1>
+  <div class="sub">
+    父进程 fork 出子进程写快照后，父子共享只读页；父进程第一次写某页，内核复制该页。
+    每个页在一次快照里最多复制一次，所以 <b>峰值内存 = 数据常驻 + 快照窗口内被写过的页 × 页大小</b>，
+    最坏 2 倍。30 GB 数据涨到 60 GB 正是撞上这个上界。
+  </div>
+</header>
+<div class="wrap">
+<nav id="nav">
+  <button data-tab="overview" class="on">① 现场复现</button>
+  <button data-tab="curves">② 复制曲线与峰值</button>
+  <button data-tab="heat">③ 页热度与延迟对齐</button>
+  <button data-tab="layout">④ 键值在页上的分布</button>
+  <button data-tab="huge">⑤ 大页的代价</button>
+  <button data-tab="matrix">⑥ 场景矩阵</button>
+  <button data-tab="bench">⑦ 实测 vs 推演</button>
+  <button data-tab="advice">⑧ 建议与效果</button>
+</nav>
+<main>
+
+<section id="overview" class="on">
+  <div class="grid g3">
+    <div class="card"><div class="kpi"><div class="l">现状峰值（30 GiB · THP · 120 s 快照）</div>
+      <div class="v" id="k-peak">–</div><div class="h" id="k-peak-h"></div></div></div>
+    <div class="card"><div class="kpi"><div class="l">物理内存占用 / 64 GiB</div>
+      <div class="v" id="k-rho">–</div><div class="h" id="k-rho-h"></div></div></div>
+    <div class="card"><div class="kpi"><div class="l">快照期间 p99 延迟</div>
+      <div class="v" id="k-p99">–</div><div class="h" id="k-p99-h"></div></div></div>
+  </div>
+
+  <div class="card">
+    <h2>同样的 30 GiB、64 GiB 内存，什么组合会把内存顶爆</h2>
+    <p class="note">横轴是快照时长，纵轴是峰值内存。数据量固定 30 GiB（有效利用率 0.85 → 常驻 35.3 GiB），
+      写按均匀随机落页。每条线是一个写入速率。虚线是 64 GiB 物理内存。</p>
+    <canvas id="cv-incident" data-h="300" height="300"></canvas>
+    <div class="legend" id="incident-legend"></div>
+  </div>
+
+  <div class="card">
+    <h2>为什么"写太多"和"快照太慢"其实是一件事</h2>
+    <p class="note">
+      决定复制量的只有 <code>n = 写入速率 × 快照时长</code> 与页数 P 的比值。
+      "写入速率翻倍"和"快照时长翻倍"对峰值的影响完全相同。下面每一格是峰值倍数；
+      行是写入速率，列是快照时长。
+    </p>
+    <div id="incident-table"></div>
+  </div>
+</section>
+
+<section id="curves">
+  <div class="card">
+    <div class="controls">
+      <label>场景 <select id="curve-sel"></select></label>
+      <label><input type="checkbox" id="curve-lat" /> 叠加延迟曲线</label>
+    </div>
+    <h2 id="curve-title">复制页数与内存随时间</h2>
+    <p class="note" id="curve-note"></p>
+    <canvas id="cv-curve" data-h="320" height="320"></canvas>
+    <div class="legend"><span><i style="background:#5aa9ff"></i>父进程数据区内存 (GiB)</span>
+      <span><i style="background:#c792ea"></i>累计复制页数</span>
+      <span><i style="background:#ffb454"></i>采样请求延迟 (ms)</span>
+      <span><i style="background:#ff6b6b"></i>发生 COW 的请求</span></div>
+  </div>
+  <div class="grid" id="curve-kpis" style="grid-template-columns:repeat(4,1fr)"></div>
+
+  <div class="card">
+    <h2>四个业务形态并排看</h2>
+    <p class="note">同样的 30 GiB、50k 写/秒、120 s 快照，只是写入分布不同。曲线形状的差异就是结论。</p>
+    <div class="grid g2" id="curve-small"></div>
+  </div>
+</section>
+
+<section id="heat">
+  <div class="card">
+    <div class="controls"><label>场景 <select id="heat-sel"></select></label></div>
+    <h2>页热度：写入落在哪些页上</h2>
+    <p class="note">横轴按页的热度秩排列（最热在左），颜色越亮表示该页被写得越频繁。
+      热键形态下热度集中在最左边极窄的一条，均匀写则整条都亮。</p>
+    <div id="heat-map"></div>
+    <div class="legend"><span class="small">深蓝 = 冷（几乎不写）　橙 = 热（反复写）　色阶为对数刻度</span></div>
+  </div>
+  <div class="card">
+    <h2>请求延迟与页复制事件对齐</h2>
+    <p class="note">每个点是一个采样请求。横轴是快照进行的时间，纵轴是该请求的延迟。
+      红色点是当时命中了一次 COW 的请求。可以直观看到"快照刚开始时每次写都复制"，
+      以及延迟在内存逼近水线时的整体抬升。</p>
+    <canvas id="cv-lat" data-h="300" height="300"></canvas>
+    <div class="legend"><span><i style="background:#8b97a8"></i>普通请求</span>
+      <span><i style="background:#ff6b6b"></i>命中 COW</span></div>
+  </div>
+</section>
+
+<section id="layout">
+  <div class="card">
+    <h2>小键值挤在页里，大键值跨页</h2>
+    <p class="note">60 万个键、4 KiB 页，含 0.4% 大键值，并做了 12 万次删除 + 9 万次插入制造空洞。
+      每一列是一段连续页的平均占用率；亮黄=满，暗=空。</p>
+    <div id="layout-strip"></div>
+    <div class="grid" id="layout-kpis" style="margin-top:14px;grid-template-columns:repeat(4,1fr)"></div>
+  </div>
+  <div class="grid g2">
+    <div class="card"><h2>写一个键弄脏多少页</h2>
+      <p class="note">小键值恒为 1 页；大键值连续跨页。灰柱是页数区间的写次数。</p>
+      <div id="dirty-chart"></div></div>
+    <div class="card"><h2>键值大小分布</h2>
+      <p class="note">大量 64~128 B 的小键值，长尾是大键值。</p>
+      <div id="size-chart"></div></div>
+  </div>
+  <div class="card"><h2>为什么空洞让情况更糟</h2>
+    <p class="note">删除和过期不会把页还给系统。这些页仍然占内存、仍然会被 COW 复制。
+      有效利用率从 0.95 掉到 0.75，同样的数据量要多占 27% 的页。</p>
+    <table id="util-table"></table>
+  </div>
+</section>
+
+<section id="huge">
+  <div class="card">
+    <h2>开大页：写一个字节复制 2 MiB</h2>
+    <p class="note">2 MiB 大页里 512 个 4 KiB 页共用一个 COW 状态。命中任意一个字节，整块都要复制。</p>
+    <div class="grid g2">
+      <div><canvas id="cv-huge-mem" data-h="240" height="240"></canvas></div>
+      <div><canvas id="cv-huge-lat" data-h="240" height="240"></canvas></div>
+    </div>
+    <div class="legend"><span><i style="background:#5aa9ff"></i>基页 4 KiB</span>
+      <span><i style="background:#c792ea"></i>2 MiB 大页</span></div>
+  </div>
+  <div class="grid g3" id="huge-kpis"></div>
+  <div class="card">
+    <h2>实测：单次 COW 停顿</h2>
+    <p class="note">真机 fork 后父进程写一页，测量那一次系统调用的耗时。
+      基页是 16 KiB（本机），大页那一列是强制复制 2 MiB。</p>
+    <table id="huge-table"></table>
+  </div>
+</section>
+
+<section id="matrix">
+  <div class="card">
+    <div class="controls">
+      <label>数据量 <select id="mx-data">
+        <option value="10">10 GiB</option><option value="20">20 GiB</option>
+        <option value="30" selected>30 GiB</option><option value="40">40 GiB</option>
+      </select></label>
+      <label>快照时长 <select id="mx-snap">
+        <option value="60">60 s</option><option value="120" selected>120 s</option>
+        <option value="300">300 s</option>
+      </select></label>
+      <label>大页 <select id="mx-huge">
+        <option value="0">关</option><option value="1">开</option>
+      </select></label>
+    </div>
+    <h2>峰值倍数矩阵</h2>
+    <p class="note">行是写入模式，列是写入速率。单元格是峰值内存 / 数据常驻。红色表示会越过 64 GiB。</p>
+    <div id="matrix-table"></div>
+  </div>
+</section>
+
+<section id="bench">
+  <div class="card">
+    <h2>真机 fork 实测 vs 模型推演</h2>
+    <p class="note">在本机（macOS / arm64 / 16 KiB 页）真正 fork、真正写、用
+      <code>task_info(TASK_EVENTS_INFO)</code> 数被复制的页。实测 arena 是等长灌满的，
+      所以推演侧用 util=1.0 对齐。</p>
+    <table id="bench-table"></table>
+  </div>
+  <div class="card">
+    <h2>模型内部交叉验证</h2>
+    <p class="note">解析解（独立同分布期望）、逐块位图仿真、桶近似三种实现互相对照。</p>
+    <table id="sim-table"></table>
+  </div>
+  <div class="card">
+    <h2>实测的内存曲线</h2>
+    <div class="controls"><label>实验 <select id="bench-sel"></select></label></div>
+    <canvas id="cv-bench" data-h="280" height="280"></canvas>
+  </div>
+</section>
+
+<section id="advice">
+  <div class="card">
+    <h2>七种调整，各自的峰值与延迟</h2>
+    <p class="note">基线：30 GiB、64 GiB 内存、THP 开、120 s 全量 COW 快照、50k 写/秒。</p>
+    <table id="adv-table"></table>
+  </div>
+  <div class="card">
+    <h2>单机放多少数据安全</h2>
+    <p class="note">快照 60 s、50k 写/秒。曲线是峰值内存随数据量的变化。
+      安全线取 64 GiB 的 85%，因为越过之后系统开始回收/压缩，延迟就压不住了。</p>
+    <canvas id="cv-vol" data-h="280" height="280"></canvas>
+    <div class="legend"><span><i style="background:#ff6b6b"></i>64 GiB</span>
+      <span><i style="background:#ffb454"></i>85% 水线</span></div>
+  </div>
+  <div class="card" id="advice-text"></div>
+</section>
+
+</main>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const fmt = (x,d=1) => (x==null||isNaN(x)) ? "–" : Number(x).toFixed(d);
+
+let DATA={}, CURVES={}, HEAT={}, LAYOUT={}, MATRIX={rows:[]}, SUMMARY={};
+
+async function load(){
+  const safe = f => { try { f(); } catch(e){ console.error("init error", f.name, e); } };
+  const [d,c,h,l,m] = await Promise.all([
+    fetch("data/dashboard.json").then(r=>r.json()).catch(()=>({})),
+    fetch("data/curves.json").then(r=>r.json()).catch(()=>({})),
+    fetch("data/heatmap.json").then(r=>r.json()).catch(()=>({})),
+    fetch("data/layout.json").then(r=>r.json()).catch(()=>({})),
+    fetch("data/matrix.json").then(r=>r.json()).catch(()=>({})),
+  ]);
+  DATA=d; CURVES=c; HEAT=h; LAYOUT=l; MATRIX=m;
+  if(d.recommendations) SUMMARY=d;
+  [drawOverview, initCurves, initHeat, drawLayout, drawHuge, initMatrix,
+   drawBench, drawAdvice].forEach(f=>safe(f));
+  if(location.hash) safe(()=>activate(location.hash.slice(1)));
+}
+
+/* ---------- 通用绘图 ---------- */
+function ctxOf(cv){
+  if(typeof cv==="string") cv=$(cv);
+  if(!cv || typeof cv.getContext!=="function") return {g:null,w:0,h:0};
+  const dpr = window.devicePixelRatio||1;
+  const cssH = parseInt(cv.dataset.h||cv.getAttribute("height")||"300",10);
+  const w = cv.clientWidth || cv.parentElement?.clientWidth || 600;
+  const h = cssH;
+  cv.width = w*dpr; cv.height = h*dpr;
+  cv.style.height = h+"px";
+  const g = cv.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  return {g,w,h};
+}
+function axes(g,w,h,pad,xr,yr,xlab,ylab,tickY=5){
+  if(!g) return {X:v=>0,Y:v=>0};
+  g.strokeStyle="#2a3240"; g.fillStyle="#8b97a8"; g.lineWidth=1;
+  g.font="11px -apple-system,sans-serif";
+  const [x0,x1]=xr,[y0,y1]=yr;
+  for(let i=0;i<=tickY;i++){
+    const y=pad.t+(h-pad.t-pad.b)*i/tickY;
+    const v=y1-(y1-y0)*i/tickY;
+    g.beginPath(); g.moveTo(pad.l,y); g.lineTo(w-pad.r,y); g.stroke();
+    g.textAlign="right"; g.textBaseline="middle"; g.fillText(fmt(v, v>100?0:1), pad.l-6, y);
+  }
+  for(let i=0;i<=4;i++){
+    const x=pad.l+(w-pad.l-pad.r)*i/4;
+    const v=x0+(x1-x0)*i/4;
+    g.textAlign="center"; g.textBaseline="top"; g.fillText(fmt(v,v>100?0:0), x, h-pad.b+6);
+  }
+  if(xlab){g.textAlign="right";g.fillText(xlab,w-pad.r,h-pad.b+22);}
+  if(ylab){g.save();g.translate(11,(pad.t+h-pad.b)/2);g.rotate(-Math.PI/2);
+    g.textAlign="center";g.textBaseline="top";g.fillStyle="#8b97a8";g.fillText(ylab,0,0);g.restore();}
+  return {X:v=>pad.l+(w-pad.l-pad.r)*(v-x0)/(x1-x0),
+          Y:v=>h-pad.b-(h-pad.t-pad.b)*(v-y0)/(y1-y0)};
+}
+function line(g,pts,color,width=1.6,dash=null){
+  if(!g || !pts.length) return;
+  g.save(); g.strokeStyle=color; g.lineWidth=width;
+  if(dash) g.setLineDash(dash);
+  g.beginPath(); pts.forEach((p,i)=> i?g.lineTo(p[0],p[1]):g.moveTo(p[0],p[1])); g.stroke(); g.restore();
+}
+
+/* ---------- ① 现场 ---------- */
+function drawOverview(){
+  const b = DATA.baseline; if(!b) return;
+  const rec = (DATA.recommendations||[]).find(r=>r.name.startsWith("现状"));
+  if(rec){
+    $("#k-peak").textContent = fmt(rec.peak_gib,1)+" GiB";
+    $("#k-peak-h").textContent = `数据常驻 ${fmt(rec.peak_gib/rec.peak_ratio,1)} GiB · ${fmt(rec.peak_ratio,2)} 倍`;
+    $("#k-rho").textContent = fmt(rec.rho*100,0)+"%";
+    $("#k-rho-h").textContent = rec.oom_risk ? "已越过物理内存 → 两次被 OOM 杀掉" : "接近物理内存";
+    $("#k-p99").textContent = fmt(rec.p99_ms,1)+" ms";
+    $("#k-p99-h").textContent = `p99.9 ${fmt(rec.p999_ms,1)} ms · 基线约 8 ms`;
+  }
+  // peak table -> 折线：x=snapshot_seconds, series=write_rate
+  const rows=b.peak_table;
+  const rates=[...new Set(rows.map(r=>r.write_rate))].sort((a,b)=>a-b);
+  const snaps=[...new Set(rows.map(r=>r.snapshot_seconds))].sort((a,b)=>a-b);
+  const {g,w,h}=ctxOf($("#cv-incident"));
+  const pad={l:64,r:14,t:12,b:38};
+  const ymax=Math.max(75, ...rows.map(r=>r.peak_gib));
+  const xs=[Math.min(...snaps), Math.max(...snaps)];
+  const A=axes(g,w,h,pad,xs,[0,Math.ceil(ymax/10)*10],"快照时长 (秒)","峰值内存 (GiB)",6);
+  // 注意：A.X 的横向映射用的是 xs 范围；必须保证 x0<x1，否则所有点挤到一处
+  const colors=["#5aa9ff","#57d38c","#ffb454","#ff6b6b","#c792ea"];
+  rates.forEach((rate,i)=>{
+    const pts=rows.filter(r=>r.write_rate===rate).map(r=>[A.X(r.snapshot_seconds),A.Y(r.peak_gib)]);
+    line(g,pts,colors[i%colors.length],1.8);
+  });
+  // 速率图例放到 HTML 里（见 #incident-legend），避免压住曲线
+  line(g,[[pad.l,A.Y(64)],[w-pad.r,A.Y(64)]],"#ff6b6b",1.2,[5,4]);
+  line(g,[[pad.l,A.Y(64*0.85)],[w-pad.r,A.Y(64*0.85)]],"#ffb454",1.2,[3,4]);
+
+  // table with ratio
+  // 图例：每个速率一种颜色 + 两条参考线
+  const legendColors=["#5aa9ff","#57d38c","#ffb454","#ff6b6b","#c792ea"];
+  $("#incident-legend").innerHTML =
+    rates.map((rate,i)=>`<span><i style="background:${legendColors[i%5]}"></i>${rate/1000}k 写/秒</span>`).join("") +
+    `<span><i style="background:#ff6b6b;opacity:.8"></i>64 GiB 物理内存</span>` +
+    `<span><i style="background:#ffb454"></i>85% 回收水线</span>`;
+
+  const byKey={}; rows.forEach(r=>byKey[[r.write_rate,r.snapshot_seconds]]=r);
+  let html="<table><thead><tr><th>写入速率 \\ 快照时长</th>";
+  snaps.forEach(s=>html+=`<th>${s}s</th>`); html+="</tr></thead><tbody>";
+  rates.forEach(rate=>{
+    html+=`<tr><td>${rate/1000}k 写/秒</td>`;
+    snaps.forEach(s=>{
+      const r=byKey[[rate,s]];
+      const cls = r.oom_risk ? "bad" : (r.rho>0.85 ? "warn":"");
+      html+=`<td class="${cls}">${fmt(r.peak_ratio,2)}×<br><span class="small">${fmt(r.peak_gib,1)} GiB</span></td>`;
+    });
+    html+="</tr>";
+  });
+  html+="</tbody></table>";
+  $("#incident-table").innerHTML=html;
+}
+
+/* ---------- ② 曲线 ---------- */
+function initCurves(){
+  const sel=$("#curve-sel");
+  sel.innerHTML=Object.entries(CURVES).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join("");
+  sel.onchange=()=>drawCurve();
+  $("#curve-lat").onchange=()=>drawCurve();
+  drawCurve();
+  drawCurveKpis();
+  drawSmallMultiples();
+}
+function drawCurve(){
+  const key=$("#curve-sel").value, c=CURVES[key]; if(!c) return;
+  $("#curve-title").textContent = c.label + " · 复制页数与内存";
+  $("#curve-note").textContent =
+    `数据常驻 ${fmt(c.resident_gib,1)} GiB · 复制单元 ${c.block_kib>=1024?(c.block_kib/1024)+" MiB":c.block_kib+" KiB"} × ${c.n_blocks.toLocaleString()} 个 · `+
+    `快照窗口 ${fmt(c.snapshot_seconds,0)} 秒 · 结束时复制了 ${fmt(c.copied_fraction*100,1)}% 的单元`;
+  const showLat=$("#curve-lat").checked;
+  const {g,w,h}=ctxOf($("#cv-curve"));
+  const pad={l:56,r:56,t:14,b:38};
+  const ymax=Math.max(c.resident_gib*1.1, ...c.mem_gib)*1.02;
+  const A=axes(g,w,h,pad,[0,c.snapshot_seconds],[0,ymax],"快照进行时间 (秒)","内存 (GiB)",6);
+  // 面积
+  g.beginPath(); g.moveTo(A.X(0),A.Y(0));
+  c.t.forEach((t,i)=>g.lineTo(A.X(t),A.Y(c.mem_gib[i])));
+  g.lineTo(A.X(c.t[c.t.length-1]),A.Y(0)); g.closePath();
+  g.fillStyle="rgba(90,169,255,.12)"; g.fill();
+  line(g,c.t.map((t,i)=>[A.X(t),A.Y(c.mem_gib[i])]),"#5aa9ff",2);
+  // 复制页数（右轴）
+  const cmax=Math.max(...c.copied)*1.05;
+  const Y2=v=>h-pad.b-(h-pad.t-pad.b)*v/cmax;
+  line(g,c.t.map((t,i)=>[A.X(t),Y2(c.copied[i])]),"#c792ea",1.6,[4,3]);
+  g.fillStyle="#c792ea"; g.textAlign="left"; g.font="10.5px sans-serif";
+  for(let i=0;i<=3;i++){
+    const v=cmax*i/3, y=Y2(v);
+    const label = v>=1e6 ? (v/1e6).toFixed(1)+"M" : v>=1e3 ? (v/1e3).toFixed(0)+"k" : v.toFixed(0);
+    g.fillText(label, w-pad.r+5, y+3);
+  }
+  g.save(); g.translate(w-8, pad.t+4); g.rotate(Math.PI/2);
+  g.textAlign="left"; g.fillText("复制页数",0,0); g.restore();
+  if(showLat && c.lat){
+    const lmax=Math.max(12,...c.lat.map(p=>p.ms))*1.1;
+    const Y3=v=>h-pad.b-(h-pad.t-pad.b)*v/lmax;
+    c.lat.forEach(p=>{
+      g.fillStyle=p.cow?"rgba(255,107,107,.75)":"rgba(255,180,84,.45)";
+      g.beginPath(); g.arc(A.X(p.t),Y3(p.ms),p.cow?2.2:1.4,0,7); g.fill();
+    });
+    g.fillStyle="#8b97a8"; g.textAlign="right"; g.fillText(fmt(lmax,0)+" ms", w-pad.r-4, pad.t+10);
+  }
+  // resident 基线
+  line(g,[[pad.l,A.Y(c.resident_gib)],[w-pad.r,A.Y(c.resident_gib)]],"#8b97a8",1,[2,4]);
+  g.fillStyle="#8b97a8"; g.textAlign="left"; g.fillText("数据常驻", pad.l+4, A.Y(c.resident_gib)-5);
+}
+function drawCurveKpis(){
+  const key=$("#curve-sel").value, c=CURVES[key]; if(!c){return}
+  const rows=[
+    ["峰值内存", fmt(c.peak_gib,1)+" GiB", fmt(c.peak_ratio,2)+" 倍"],
+    ["复制页数", c.copied[c.copied.length-1].toLocaleString(undefined,{maximumFractionDigits:0}), fmt(c.copied_fraction*100,1)+"% 的单元"],
+    ["占总内存", fmt(c.rho*100,0)+"%", c.rho>=1?"超了，会被 OOM":"64 GiB 中"],
+    ["p99 / p99.9", fmt(c.p99_ms,1)+" / "+fmt(c.p999_ms,1)+" ms", "基线约 8 / 20 ms"],
+  ];
+  $("#curve-kpis").innerHTML=rows.map(r=>
+    `<div class="card"><div class="kpi"><div class="l">${r[0]}</div>
+     <div class="v" style="font-size:21px">${r[1]}</div><div class="h">${r[2]}</div></div></div>`).join("");
+}
+function drawSmallMultiples(){
+  const keys=["uniform","sequential","hotkey","zipf"];
+  $("#curve-small").innerHTML=keys.map(k=>{
+    const c=CURVES[k]; if(!c) return "";
+    return `<div class="card"><h2 style="font-size:13px">${c.label}</h2>
+      <div class="small" style="margin-bottom:6px">峰值 ${fmt(c.peak_gib,1)} GiB · ${fmt(c.peak_ratio,2)} 倍 · 复制 ${fmt(c.copied_fraction*100,0)}%</div>
+      <canvas id="sm-${k}" data-h="150" height="150"></canvas></div>`;
+  }).join("");
+  keys.forEach(k=>{
+    const c=CURVES[k], cv=document.getElementById("sm-"+k); if(!cv) return;
+    const {g,w,h}=ctxOf(cv); const pad={l:34,r:8,t:8,b:24};
+    const ymax=Math.max(...c.mem_gib)*1.02;
+    const A=axes(g,w,h,pad,[0,c.snapshot_seconds],[c.resident_gib*0.9,ymax],"","",3);
+    line(g,c.t.map((t,i)=>[A.X(t),A.Y(c.mem_gib[i])]),"#5aa9ff",1.8);
+    line(g,[[pad.l,A.Y(c.resident_gib)],[w-pad.r,A.Y(c.resident_gib)]],"#8b97a8",1,[2,3]);
+  });
+}
+
+/* ---------- ③ 热度 ---------- */
+function initHeat(){
+  const sel=$("#heat-sel");
+  sel.innerHTML=Object.entries(HEAT).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join("");
+  if(HEAT["hotkey"]) sel.value="hotkey";
+  sel.onchange=()=>{drawHeat();drawLat()};
+  drawHeat(); drawLat();
+}
+function drawHeat(){
+  const key=$("#heat-sel").value, h=HEAT[key]; if(!h) return;
+  const N=96;
+  // 把 256 段热度聚合成 N 列（取段内均值）
+  const per=h.heat.length/N;
+  const cols=[];
+  for(let i=0;i<N;i++){
+    let s=0,n=0;
+    for(let j=Math.floor(i*per);j<Math.min(h.heat.length,Math.floor((i+1)*per));j++){s+=h.heat[j];n++}
+    cols.push(n?s/n:0);
+  }
+  const maxv=Math.max(...cols,1e-12);
+  const minv=Math.max(Math.min(...cols.filter(v=>v>0),maxv),1e-12);
+  const logMax=Math.log(maxv), logMin=Math.log(minv);
+  const flat=(logMax-logMin)<1e-6;   // 均匀分布：所有列一样热
+  const color=v=>{
+    if(v<=0) return "rgba(45,60,88,1)";
+    const t = flat ? 0.78 : Math.max(0,Math.min(1,(Math.log(v)-logMin)/(logMax-logMin||1)));
+    // 冷端不用透明度，改用可分辨的深蓝，保证"几乎不写"的页也能看见
+    const r = Math.round(34 + 221*t), gg = Math.round(56 + 110*t), b = Math.round(92 + 30*t);
+    return `rgb(${r},${gg},${b})`;
+  };
+  const bars = cols.map((v,i)=>
+    `<div title="热度秩前 ${(i*100/N).toFixed(1)}% 的页段：相对热度 ${(v/maxv*100).toFixed(1)}%" style="background:${color(v)}"></div>`).join("");
+  // 头部放大：只画前 3% 的页（热键的关键区）
+  const headN=Math.max(4,Math.round(N*0.06));
+  const headBars = cols.slice(0,headN).map((v,i)=>
+    `<div title="秩 ${i}：相对热度 ${(v/maxv*100).toFixed(1)}%" style="background:${color(v)}"></div>`).join("");
+  $("#heat-map").innerHTML=
+    `<div class="small" style="margin-bottom:6px">全部页 · 按热度秩排列（最热在左）</div>
+     <div class="hm" style="grid-template-columns:repeat(${N},1fr)">${bars}</div>
+     <div class="small" style="margin:12px 0 6px">放大最左边 6% 的页（热区）</div>
+     <div class="hm head" style="grid-template-columns:repeat(${headN},1fr)">${headBars}</div>`;
+}
+
+function drawLat(){
+  const key=$("#heat-sel").value, c=CURVES[key]; if(!c||!c.lat) return;
+  const {g,w,h}=ctxOf($("#cv-lat"));
+  const pad={l:50,r:14,t:12,b:36};
+  const lmax=Math.max(12,...c.lat.map(p=>p.ms))*1.08;
+  const A=axes(g,w,h,pad,[0,c.snapshot_seconds],[0,lmax],"快照进行时间 (秒)","请求延迟 (ms)",5);
+  c.lat.forEach(p=>{
+    g.fillStyle=p.cow?"rgba(255,107,107,.8)":"rgba(139,151,168,.5)";
+    g.beginPath(); g.arc(A.X(p.t),A.Y(Math.min(p.ms,lmax)),p.cow?2.6:1.7,0,7); g.fill();
+  });
+  line(g,[[pad.l,A.Y(8)],[w-pad.r,A.Y(8)]],"#ffb454",1,[4,3]);
+}
+
+/* ---------- ④ 布局 ---------- */
+function drawLayout(){
+  const L=LAYOUT; if(!L||!L.col_occ) return;
+  let html='<div style="display:flex;gap:1px;height:44px;margin-top:4px">';
+  L.col_occ.forEach((v,i)=>{
+    const t=Math.pow(v,0.7);
+    html+=`<div title="页段 ${i}: 占用率 ${(v*100).toFixed(1)}%" style="flex:1;background:rgba(${Math.round(30+225*t)},${Math.round(36+190*t)},${Math.round(48+90*Math.min(1,t*1.4))},${0.2+0.8*t});border-radius:1px"></div>`;
+  });
+  html+="</div>";
+  // 第二行：每段存活对象数（对数）
+  html+='<div style="display:flex;gap:1px;height:22px;margin-top:2px">';
+  const maxLive=Math.max(...L.col_live,1);
+  L.col_live.forEach(v=>{
+    const t=Math.log1p(v)/Math.log1p(maxLive);
+    html+=`<div title="${v} 个对象" style="flex:1;background:rgba(90,169,255,${0.08+0.8*t});border-radius:1px"></div>`;
+  });
+  html+="</div>";
+  $("#layout-strip").innerHTML=html;
+
+  const rows=[
+    ["页数", L.n_pages.toLocaleString(), `${fmt(L.data_mib,0)} MiB 逻辑数据`],
+    ["有效利用率", fmt(L.util*100,1)+"%", "已用 / 总页容量"],
+    ["满页占比", fmt(L.occupancy.full*100,0)+"%", `有空洞 ${fmt(L.occupancy.partial*100,0)}%`],
+    ["每页平均对象", fmt(L.n_keys/L.n_pages,1), "小键值扎堆"],
+  ];
+  $("#layout-kpis").innerHTML=rows.map(r=>
+    `<div class="card"><div class="kpi"><div class="l">${r[0]}</div>
+     <div class="v" style="font-size:20px">${r[1]}</div><div class="h">${r[2]}</div></div></div>`).join("");
+
+  drawHist("#dirty-chart", L.dirty_hist, "#8b97a8", "脏页数");
+  drawHist("#size-chart", L.size_hist, "#5aa9ff", "键值大小");
+
+  const util=[0.95,0.90,0.85,0.80,0.75,0.70];
+  let tbl="<thead><tr><th>有效利用率</th><th>30 GiB 需要的页</th><th>相对 0.95 多占</th><th>COW 上界</th></tr></thead><tbody>";
+  const base=Math.ceil(30*1024**3/(4096*0.95));
+  util.forEach(u=>{
+    const p=Math.ceil(30*1024**3/(4096*u));
+    tbl+=`<tr><td>${fmt(u*100,0)}%</td><td>${p.toLocaleString()}</td>
+      <td>${fmt((p/base-1)*100,1)}%</td><td>+${fmt(p*4096/2**30,1)} GiB</td></tr>`;
+  });
+  $("#util-table").innerHTML=tbl+"</tbody>";
+}
+function drawHist(sel,hist,color,label){
+  const host=$(sel); if(!host) return;
+  host.innerHTML='<canvas data-h="200" height="200"></canvas>';
+  const cv=host.querySelector("canvas");
+  const {g,w,h}=ctxOf(cv); if(!g) return; const pad={l:40,r:10,t:10,b:34};
+  const keys=Object.keys(hist), vals=Object.values(hist);
+  const vmax=Math.max(...vals,1);
+  const A=axes(g,w,h,pad,[0,keys.length],[0,vmax],label,"写次数",4);
+  const bw=(w-pad.l-pad.r)/keys.length;
+  keys.forEach((k,i)=>{
+    const x=pad.l+i*bw, y=A.Y(vals[i]);
+    g.fillStyle=color; g.globalAlpha=0.35+0.65*(i/Math.max(1,keys.length-1));
+    g.fillRect(x+bw*0.12, y, bw*0.76, h-pad.b-y);
+    g.globalAlpha=1;
+    g.fillStyle="#8b97a8"; g.font="9.5px sans-serif"; g.textAlign="center";
+    g.save(); g.translate(x+bw/2,h-pad.b+4); g.rotate(-Math.PI/3);
+    g.textAlign="right"; g.fillText(k,0,0); g.restore();
+  });
+}
+
+/* ---------- ⑤ 大页 ---------- */
+function drawHuge(){
+  const base=CURVES["uniform"], huge=CURVES["uniform-huge"];
+  if(!base||!huge) return;
+  { const {g,w,h}=ctxOf($("#cv-huge-mem")); const pad={l:48,r:12,t:14,b:34};
+    const ymax=Math.max(...huge.mem_gib,...base.mem_gib)*1.03;
+    const A=axes(g,w,h,pad,[0,Math.max(base.snapshot_seconds,huge.snapshot_seconds)],[0,ymax],"时间 (秒)","内存 (GiB)",5);
+    line(g,base.t.map((t,i)=>[A.X(t),A.Y(base.mem_gib[i])]),"#5aa9ff",1.8);
+    line(g,huge.t.map((t,i)=>[A.X(t),A.Y(huge.mem_gib[i])]),"#c792ea",1.8,[5,3]);
+  }
+  { const {g,w,h}=ctxOf($("#cv-huge-lat")); const pad={l:48,r:12,t:14,b:34};
+    const lmax=Math.max(12,...huge.lat.map(p=>p.ms))*1.1;
+    const A=axes(g,w,h,pad,[0,huge.snapshot_seconds],[0,lmax],"时间 (秒)","样本延迟 (ms)",5);
+    huge.lat.forEach(p=>{g.fillStyle="rgba(199,146,234,.6)";g.beginPath();g.arc(A.X(p.t),A.Y(Math.min(p.ms,lmax)),1.8,0,7);g.fill();});
+    line(g,[[pad.l,A.Y(8)],[w-pad.r,A.Y(8)]],"#ffb454",1,[4,3]);
+  }
+  const rv = DATA.recommendations||[];
+  const cheap = (DATA.bench_vs_model||[]).find(b=>b.name==="lat_base_uniform");
+  const exp  = (DATA.bench_vs_model||[]).find(b=>b.name==="lat_huge_uniform");
+  const rows=[
+    ["复制单元", "4 KiB", "2 MiB（512 倍）"],
+    ["同样写 1 次复制的字节", "4 KiB", "2 MiB ×1"],
+    ["30 GiB 写满时的 COW 上界", fmt(base.peak_gib,1)+" GiB","同一个上界 "+fmt(huge.peak_gib,1)+" GiB"],
+    ["单次停顿（实测中位）", fmt((cheap?.measured_cow_p50_us||0)/1000,2)+" ms", fmt((exp?.measured_cow_p50_us||0)/1000,2)+" ms"],
+    ["50k 写/秒时的 COW CPU", "≈0.1 核", "≈2.3 核（打满）"],
+  ];
+  $("#huge-kpis").innerHTML=rows.slice(0,3).map(r=>
+    `<div class="card"><div class="kpi"><div class="l">${r[0]}</div>
+     <div class="v" style="font-size:18px">${r[1]} → ${r[2]}</div></div></div>`).join("");
+
+  let tbl="<thead><tr><th>实验</th><th>COW 次数</th><th>p50 停顿</th><th>p99 停顿</th><th>单次拷贝字节</th></tr></thead><tbody>";
+  (DATA.bench_vs_model||[]).filter(b=>b.group==="latency").forEach(b=>{
+    tbl+=`<tr><td>${b.huge?"2 MiB 大页":"16 KiB 基页"} · ${b.distribution}</td>
+      <td>${b.measured_copied.toLocaleString()}</td>
+      <td>${fmt(b.measured_cow_p50_us,1)} µs</td>
+      <td>${fmt(b.measured_cow_p99_us,1)} µs</td>
+      <td>${b.huge?"2 MiB":"16 KiB"}</td></tr>`;
+  });
+  $("#huge-table").innerHTML=tbl+"</tbody>";
+}
+
+/* ---------- ⑥ 矩阵 ---------- */
+function initMatrix(){
+  ["#mx-data","#mx-snap","#mx-huge"].forEach(s=>{ const el=$(s); if(el) el.onchange=drawMatrix; });
+  drawMatrix();
+}
+function drawMatrix(){
+  const data=+$("#mx-data").value, snap=+$("#mx-snap").value, huge=+$("#mx-huge").value;
+  const rows=(MATRIX.rows||[]).filter(r=>r.data_gib===data && r.snapshot_seconds===snap && r.huge===!!huge);
+  const dists=["uniform","hotkey","zipf","sequential"];
+  const labels={uniform:"均匀随机写",hotkey:"少数热键",zipf:"Zipf 长尾",sequential:"顺序写"};
+  const rates=[5000,25000,50000,100000,200000];
+  const byKey={};
+  rows.forEach(r=>byKey[r.distribution+"|"+r.write_rate]=r);
+  let html="<table><thead><tr><th>模式 \\ 写入速率</th>";
+  rates.forEach(r=>html+=`<th>${r/1000}k/s</th>`); html+="</tr></thead><tbody>";
+  dists.forEach(d=>{
+    html+=`<tr><td>${labels[d]}${huge?" · 大页":""}</td>`;
+    rates.forEach(rate=>{
+      const r=byKey[d+"|"+rate];
+      if(!r){html+="<td>–</td>";return;}
+      const cls = r.rho>=1 ? "bad" : (r.rho>=0.85?"warn":"good");
+      html+=`<td><span class="tag ${cls}">${fmt(r.peak_ratio,2)}×</span><br>
+        <span class="small">${fmt(r.peak_gib,1)} GiB</span></td>`;
+    });
+    html+="</tr>";
+  });
+  html+="</tbody></table>";
+  $("#matrix-table").innerHTML=html;
+}
+
+/* ---------- ⑦ 实测 ---------- */
+function drawBench(){
+  const b=(DATA.bench_vs_model||[]).filter(r=>r.group==="memory");
+  let html="<thead><tr><th>实验</th><th>数据量</th><th>实测峰值倍数</th><th>推演峰值倍数</th><th>误差</th><th>实测复制页</th><th>推演复制页</th></tr></thead><tbody>";
+  b.forEach(r=>{
+    html+=`<tr><td>${r.name.replace("mem_","")}</td><td>${r.data_gib} GiB</td>
+      <td>${fmt(r.measured_peak_ratio,3)}×</td><td>${fmt(r.model_peak_ratio,3)}×</td>
+      <td><span class="tag ${r.peak_err_pct<2?'good':(r.peak_err_pct<8?'warn':'bad')}">${fmt(r.peak_err_pct,2)}%</span></td>
+      <td>${r.measured_copied.toLocaleString()}</td>
+      <td>${r.copied_err_pct==null?"–（大页按块计）":fmt(r.model_copied,0)}</td></tr>`;
+  });
+  $("#bench-table").innerHTML=html+"</tbody>";
+
+  const s=DATA.sim_vs_model||[];
+  let t2="<thead><tr><th>分布</th><th>locality</th><th>大页</th><th>解析解 GiB</th><th>页级仿真 GiB</th><th>误差</th></tr></thead><tbody>";
+  s.forEach(r=>{
+    t2+=`<tr><td>${r.distribution}</td><td>${r.locality}</td><td>${r.huge?"开":"关"}</td>
+      <td>${fmt(r.model_peak_gib,3)}</td><td>${fmt(r.sim_peak_gib,3)}</td>
+      <td>${fmt(r.rel_err_pct,3)}%</td></tr>`;
+  });
+  $("#sim-table").innerHTML=t2+"</tbody>";
+
+  const sel=$("#bench-sel");
+  const meas=(DATA.measured||[]).filter(m=>m.curve);
+  sel.innerHTML=meas.map(m=>`<option value="${m.name}">${m.name}（实测 ${fmt(m.peak_ratio,2)}×）</option>`).join("");
+  const draw=()=>{
+    const m=meas.find(x=>x.name===sel.value); if(!m) return;
+    const {g,w,h}=ctxOf($("#cv-bench")); const pad={l:52,r:14,t:14,b:36};
+    const t=m.curve.t, mem=m.curve.mem_gib;
+    const ymax=Math.max(...mem)*1.04;
+    const A=axes(g,w,h,pad,[0,Math.max(...t)],[0,ymax],"快照进行时间 (秒)","父进程数据区 (GiB)",5);
+    line(g,t.map((x,i)=>[A.X(x),A.Y(mem[i])]),"#57d38c",2);
+    line(g,[[pad.l,A.Y(m.data_gib)],[w-pad.r,A.Y(m.data_gib)]],"#8b97a8",1,[2,4]);
+  };
+  sel.onchange=draw; draw();
+}
+
+/* ---------- ⑧ 建议 ---------- */
+function drawAdvice(){
+  const recs=DATA.recommendations||[];
+  let html="<thead><tr><th>方案</th><th>数据量</th><th>大页</th><th>快照</th><th>峰值</th><th>倍数</th><th>占内存</th><th>p99</th><th>p99.9</th><th>状态</th></tr></thead><tbody>";
+  recs.forEach(r=>{
+    const cls = r.oom_risk?"bad":(r.rho>0.85?"warn":"good");
+    const st = r.oom_risk?"会 OOM":(r.rho>0.85?"延迟失控":"安全");
+    html+=`<tr><td>${r.name}</td><td>${r.data_gib} GiB</td><td>${r.huge?"开":"关"}</td>
+      <td>${fmt(r.snapshot_seconds,0)} s</td><td>${fmt(r.peak_gib,1)} GiB</td>
+      <td>${fmt(r.peak_ratio,2)}×</td><td>${fmt(r.rho*100,0)}%</td>
+      <td>${fmt(r.p99_ms,1)} ms</td><td>${fmt(r.p999_ms,1)} ms</td>
+      <td><span class="tag ${cls}">${st}</span></td></tr>`;
+  });
+  $("#adv-table").innerHTML=html+"</tbody>";
+
+  const vol=DATA.volume_sweep||[];
+  const uni=vol.filter(v=>v.distribution==="uniform");
+  const hot=vol.filter(v=>v.distribution==="hotkey");
+  const {g,w,h}=ctxOf($("#cv-vol")); const pad={l:52,r:14,t:14,b:36};
+  const rows=vol;
+  const ymax=Math.max(72,...rows.map(r=>r.peak_gib))*1.02;
+  const xmax=Math.max(...rows.map(r=>r.data_gib));
+  const A=axes(g,w,h,pad,[0,xmax],[0,ymax],"单机数据量 (GiB)","峰值内存 (GiB)",6);
+  line(g,uni.map(r=>[A.X(r.data_gib),A.Y(r.peak_gib)]),"#5aa9ff",2);
+  line(g,hot.map(r=>[A.X(r.data_gib),A.Y(r.peak_gib)]),"#57d38c",2,[4,3]);
+  line(g,[[pad.l,A.Y(64)],[w-pad.r,A.Y(64)]],"#ff6b6b",1.2,[5,4]);
+  line(g,[[pad.l,A.Y(54.4)],[w-pad.r,A.Y(54.4)]],"#ffb454",1.2,[3,4]);
+  g.fillStyle="#5aa9ff";g.font="11px sans-serif";g.textAlign="left";
+  g.fillText("均匀写",A.X(xmax*0.55),A.Y(uni[Math.floor(uni.length*0.55)]?.peak_gib||0)-8);
+  g.fillStyle="#57d38c";g.fillText("热键写",A.X(xmax*0.55),A.Y(hot[Math.floor(hot.length*0.55)]?.peak_gib||0)+14);
+
+  const safeUni=uni.filter(r=>r.rho<=0.85).map(r=>r.data_gib).pop();
+  const safeHot=hot.filter(r=>r.rho<=0.85).map(r=>r.data_gib).pop();
+  const F=recs.find(r=>r.name.startsWith("F"));
+  const C=recs.find(r=>r.name.startsWith("C"));
+  $("#advice-text").innerHTML=`
+  <h2>结论</h2>
+  <p class="note">分成三条独立可调的旋钮，数字都来自上面的推演。</p>
+  <div class="grid g3">
+    <div class="card" style="background:var(--panel2)"><h2 style="font-size:13px">① 什么时候做快照</h2>
+      <p class="small">复制量只取决于 <code>写入速率 × 快照时长 / 页数</code>。
+      要么把快照做快（<b>缩短窗口</b>：${fmt(C?.peak_gib||0,1)} GiB 峰值），
+      要么把快照放到写入低谷。凌晨 3 点如果正好是批量导入高峰，那就是最差时间。</p></div>
+    <div class="card" style="background:var(--panel2)"><h2 style="font-size:13px">② 单机放多少数据</h2>
+      <p class="small">64 GiB 机器、60 s 窗口、50k 写/秒：均匀写安全线 <b>${safeUni||"?"} GiB</b>，
+      热键写 <b>${safeHot||"?"} GiB</b>。把数据压到 20 GiB 只是把 2 倍上界从 60 GiB 挪到 40 GiB，
+      治标不治本。</p></div>
+    <div class="card" style="background:var(--panel2)"><h2 style="font-size:13px">③ 大页开不开</h2>
+      <p class="small">大页让单次 COW 从 2 µs 变成 240 µs（<b>100 倍</b>），
+      并把每次写命中的复制量放大 512 倍。数据库这类随机写负载应当
+      <code>madvise(MADV_NOHUGEPAGE)</code> 或关掉 THP。</p></div>
+  </div>
+  <div class="card" style="background:var(--panel2);margin-top:12px">
+    <h2 style="font-size:13px">④ 数据怎么排布</h2>
+    <p class="small">
+      让热键落在尽量少的页上（locality 高）能显著压低峰值：热键 locality=1 时峰值只有
+      1.04 倍，被打散成均匀后升到 1.26 倍。反面则是大键值——它一次写就跨很多页，
+      既抬高单次停顿，也加速复制。把超过 256 KiB 的值拆成多段、或放进单独的堆外区，
+      使主数据区保持"小对象紧密打包"。
+    </p>
+  </div>
+  <div class="card" style="background:var(--panel2);margin-top:12px">
+    <h2 style="font-size:13px">⑤ 按建议调整后的组合效果</h2>
+    <p class="small">全上（20 GiB + 关 THP + 数据重排 + 60 s 窗口）：
+      峰值 <b>${fmt(F?.peak_gib||0,1)} GiB</b>（${fmt(F?.peak_ratio||0,2)} 倍），
+      占内存 ${fmt((F?.rho||0)*100,0)}%，p99 ${fmt(F?.p99_ms||0,1)} ms。
+      对照现状 ${fmt(recs[0]?.peak_gib||0,1)} GiB / p99 ${fmt(recs[0]?.p99_ms||0,1)} ms。</p>
+  </div>`;
+
+  drawVolumeNote(uni);
+}
+function drawVolumeNote(uni){
+  const bar=$("#cv-vol");
+}
+
+/* ---------- 导航 ---------- */
+function activate(tab){
+  $$("#nav button").forEach(b=>b.classList.toggle("on", b.dataset.tab===tab));
+  $$("main section").forEach(s=>s.classList.toggle("on", s.id===tab));
+  if(tab==="curves") drawCurve();
+  if(tab==="heat"){drawHeat();drawLat()}
+  if(tab==="huge") drawHuge();
+  if(tab==="advice") drawAdvice();
+  if(tab==="bench") drawBench();
+  if(tab==="matrix") drawMatrix();
+}
+$$("#nav button").forEach(btn=>{
+  btn.onclick=()=>{ location.hash=btn.dataset.tab; activate(btn.dataset.tab); };
+});
+window.addEventListener("resize",()=>{drawCurve();drawLat();drawHuge();drawAdvice();drawBench();drawMatrix();});
+window.addEventListener("hashchange",()=>activate(location.hash.slice(1)));
+load().then(()=>{ if(location.hash) activate(location.hash.slice(1)); });
+</script>
+</body>
+</html>

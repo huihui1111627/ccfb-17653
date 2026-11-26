@@ -1,0 +1,105 @@
+{
+  "platform": {
+    "system": "macOS-26.7.3-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.9.6",
+    "numpy": "2.0.2",
+    "page_size_bytes": 16384,
+    "physical_mib": 16384
+  },
+  "fork": [
+    {
+      "arena_gib": 0.25,
+      "pages": 16384,
+      "p50_ms": 0.368,
+      "min_ms": 0.25,
+      "max_ms": 0.883
+    },
+    {
+      "arena_gib": 0.5,
+      "pages": 32768,
+      "p50_ms": 0.382,
+      "min_ms": 0.225,
+      "max_ms": 1.243
+    },
+    {
+      "arena_gib": 1,
+      "pages": 65536,
+      "p50_ms": 0.361,
+      "min_ms": 0.286,
+      "max_ms": 1.999
+    },
+    {
+      "arena_gib": 2,
+      "pages": 131072,
+      "p50_ms": 0.34,
+      "min_ms": 0.224,
+      "max_ms": 3.611
+    },
+    {
+      "arena_gib": 4,
+      "pages": 262144,
+      "p50_ms": 0.373,
+      "min_ms": 0.216,
+      "max_ms": 6.82
+    },
+    {
+      "arena_gib": 6,
+      "pages": 393216,
+      "p50_ms": 0.341,
+      "min_ms": 0.248,
+      "max_ms": 9.555
+    }
+  ],
+  "cow_write_16k": {
+    "n": 16384,
+    "p50_us": 2.084,
+    "p90_us": 2.791,
+    "p99_us": 5.715,
+    "p999_us": 16.193,
+    "max_us": 25.875,
+    "mean_us": 2.269,
+    "cow_faults": 16433,
+    "pages_written": 16384
+  },
+  "plain_write_16k": {
+    "n": 16384,
+    "p50_us": 0.167,
+    "p90_us": 1.25,
+    "p99_us": 1.666,
+    "p999_us": 2.317,
+    "max_us": 16.708,
+    "mean_us": 0.42
+  },
+  "memcpy": [
+    {
+      "block_kib": 4,
+      "p50_us": 0.583,
+      "p99_us": 0.709,
+      "bandwidth_gib_s": 6.54
+    },
+    {
+      "block_kib": 16,
+      "p50_us": 0.417,
+      "p99_us": 0.542,
+      "bandwidth_gib_s": 36.59
+    },
+    {
+      "block_kib": 2048,
+      "p50_us": 28.959,
+      "p99_us": 56.872,
+      "bandwidth_gib_s": 67.44
+    }
+  ],
+  "child_scan": {
+    "scan_mib": 1024,
+    "seconds": 0.031,
+    "throughput_gib_s": 32.29,
+    "pages_per_s": 2116314
+  },
+  "python_vs_raw_cow": {
+    "touched_bytes_mib": 48,
+    "python_obj_child_cow_pages": 5,
+    "raw_mmap_child_cow_pages": 4
+  }
+}
