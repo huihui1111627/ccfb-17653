@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fork()/COW 内存与延迟仿真看板</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3;
+    --muted:#8b949e; --blue:#388bfd; --red:#f85149; --amber:#d29922;
+    --green:#3fb950; --purple:#bc8cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:-apple-system,"PingFang SC","Microsoft YaHei",monospace; font-size:13px; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0 0 4px; font-size:18px; }
+  header p { margin:0; color:var(--muted); }
+  .wrap { padding:20px 24px; max-width:1500px; margin:0 auto; }
+  .grid { display:grid; gap:16px; }
+  .g2 { grid-template-columns:1fr 1fr; }
+  .g3 { grid-template-columns:repeat(3,1fr); }
+  @media(max-width:1100px){ .g2,.g3{grid-template-columns:1fr;} }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:16px; }
+  .card h2 { margin:0 0 4px; font-size:14px; }
+  .card .sub { color:var(--muted); margin:0 0 12px; font-size:12px; }
+  canvas { width:100%; display:block; }
+  .kpi { display:flex; flex-direction:column; gap:2px; }
+  .kpi .v { font-size:22px; font-weight:600; }
+  .kpi .l { color:var(--muted); font-size:12px; }
+  .bad{color:var(--red);} .warn{color:var(--amber);} .ok{color:var(--green);}
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { padding:6px 8px; text-align:right; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child,td:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:500; cursor:pointer; user-select:none; }
+  tr:hover { background:#1c2330; }
+  .tag{padding:1px 7px;border-radius:10px;font-size:11px;}
+  .tag.on{background:#3d1418;color:#ff7b72;}
+  .tag.off{background:#0f2e1c;color:#7ee787;}
+  .controls { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom:10px;}
+  select,input[type=range]{ accent-color:var(--blue); }
+  select{background:var(--bg);color:var(--fg);border:1px solid var(--line);
+         border-radius:6px;padding:4px 8px;}
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11px; color:var(--muted);}
+  .legend i{ display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;}
+  .rec { border-left:3px solid var(--blue); padding:10px 14px; margin-bottom:10px;
+         background:#0f1722; border-radius:0 8px 8px 0;}
+  .rec h3{margin:0 0 4px;font-size:13px;}
+  .rec p{margin:0;color:var(--muted);line-height:1.6;}
+  .note{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.6;}
+  .section-title{font-size:15px;margin:26px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line);}
+</style>
+</head>
+<body>
+<header>
+  <h1>Redis 类键值库 fork() / Copy-On-Write 内存与延迟仿真看板</h1>
+  <p>键值落页 · 快照期 COW 复制曲线 · 透明大页影响 · 缺页停顿与高分位延迟 · 真实 fork 实测校验</p>
+</header>
+<div class="wrap">
+
+  <div class="grid g3" id="kpis"></div>
+
+  <h2 class="section-title">① 持久化期间被复制页数 / 内存随时间曲线</h2>
+  <div class="card">
+    <div class="controls">
+      <label>数据量 <select id="cData"></select></label>
+      <label>写入速率 <select id="cRate"></select></label>
+      <label>模式 <select id="cWl"></select></label>
+      <label>大页 <select id="cThp"></select></label>
+    </div>
+    <canvas id="curve" height="300"></canvas>
+    <div class="legend">
+      <span><i style="background:#388bfd"></i>父进程 footprint (GiB)</span>
+      <span><i style="background:#f85149"></i>累计 COW 复制 (GiB)</span>
+      <span><i style="background:#8b949e"></i>物理内存阈值线</span>
+    </div>
+  </div>
+
+  <h2 class="section-title">② 内存页热度图（活页 / 空洞 / 已复制）</h2>
+  <div class="card">
+    <div class="controls">
+      <label>快照进度 <input type="range" id="heatRange" min="0" max="100" value="100"></label>
+      <span id="heatPct">100%</span>
+      <label><input type="checkbox" id="heatPlay"> 播放</label>
+    </div>
+    <canvas id="heatmap" height="260"></canvas>
+    <div class="legend">
+      <span><i style="background:#1f6feb"></i>活数据页</span>
+      <span><i style="background:#444c56"></i>删除/过期空洞页</span>
+      <span><i style="background:#f85149"></i>已 COW 复制页</span>
+      <span><i style="background:#21262d"></i>未映射</span>
+    </div>
+    <p class="note">每格聚合多个基础页的占比颜色；滑块按复制曲线在初始/终态间插值回放。
+      空洞页已映射、fork 后被写一样复制 —— 这是删除/过期多的实例 COW 放大的原因之一。</p>
+  </div>
+
+  <h2 class="section-title">③ 请求延迟与页复制事件时间轴对齐</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h2>THP 关（4 KiB 基础页）</h2>
+      <p class="sub">容器多（数百万页），整窗几乎每写必缺页，但每次仅 ~8µs，p99 曲线平稳</p>
+      <canvas id="latBase" height="240"></canvas>
+    </div>
+    <div class="card">
+      <h2>THP 开（2 MiB 大页）</h2>
+      <p class="sub">容器少（数千大页），缺页风暴集中在快照初期后快速衰减；每次 ~150µs，尖刺与故障率同步</p>
+      <canvas id="latHuge" height="240"></canvas>
+    </div>
+  </div>
+
+  <h2 class="section-title">④ 事故复现：30 GiB 数据 / 64 GiB 机器（四种写入模式）</h2>
+  <div class="card">
+    <table id="incidentTable"></table>
+  </div>
+
+  <h2 class="section-title">⑤ 参数网格（192 组：数据量 × 速率 × 时长 × 模式 × 大页）</h2>
+  <div class="card">
+    <div class="controls">
+      <label>筛选大页 <select id="fThp"><option value="">全部</option><option value="1">THP开</option><option value="0">THP关</option></select></label>
+      <label>筛选模式 <select id="fWl"><option value="">全部</option></select></label>
+    </div>
+    <div style="max-height:420px;overflow:auto;">
+      <table id="sweepTable"></table>
+    </div>
+  </div>
+
+  <h2 class="section-title">⑥ 真实 fork() 本机实测 vs 仿真</h2>
+  <div class="card">
+    <table id="validTable"></table>
+    <p class="note" id="validNote"></p>
+  </div>
+
+  <h2 class="section-title">⑦ 建议与调整后推演</h2>
+  <div id="recs"></div>
+  <div class="card" style="margin-top:12px;">
+    <h2>同口径场景推演（现状 → 逐步调整）</h2>
+    <table id="scenTable"></table>
+  </div>
+
+</div>
+<script src="report.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

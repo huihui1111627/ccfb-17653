@@ -1,0 +1,61 @@
+{
+  "platform": "darwin",
+  "page_size_native": 16384,
+  "arena_mib": 128,
+  "writes": 12000,
+  "rows": [
+    {
+      "mode": "uniform",
+      "page_size": 16384,
+      "real_unique_pages": 6265,
+      "kernel_cow_faults": 6468,
+      "sim_unique_pages": 6265,
+      "page_count_error_pct": 0.0,
+      "kernel_count_error_pct": 3.2402234636871508,
+      "expected_copied_bytes": 102645760,
+      "footprint_delta_bytes": 786432,
+      "footprint_delta_error_pct": 99.2338387869114,
+      "real_fault_p50_us": 2.334,
+      "real_fault_p99_us": 5.20836,
+      "real_repeat_p50_us": 0.208,
+      "fault_vs_repeat_x": 11.221153846153847
+    },
+    {
+      "mode": "hotkey",
+      "page_size": 16384,
+      "real_unique_pages": 2356,
+      "kernel_cow_faults": 2579,
+      "sim_unique_pages": 2356,
+      "page_count_error_pct": 0.0,
+      "kernel_count_error_pct": 9.465195246179967,
+      "expected_copied_bytes": 38600704,
+      "footprint_delta_bytes": 262144,
+      "footprint_delta_error_pct": 99.32088285229202,
+      "real_fault_p50_us": 3.2705,
+      "real_fault_p99_us": 14.184899999999992,
+      "real_repeat_p50_us": 0.25,
+      "fault_vs_repeat_x": 13.082
+    },
+    {
+      "mode": "sequential",
+      "page_size": 16384,
+      "real_unique_pages": 8192,
+      "kernel_cow_faults": 8368,
+      "sim_unique_pages": 8192,
+      "page_count_error_pct": 0.0,
+      "kernel_count_error_pct": 2.1484375,
+      "expected_copied_bytes": 134217728,
+      "footprint_delta_bytes": 0,
+      "footprint_delta_error_pct": 100.0,
+      "real_fault_p50_us": 2.083,
+      "real_fault_p99_us": 5.20809,
+      "real_repeat_p50_us": 0.167,
+      "fault_vs_repeat_x": 12.47305389221557
+    }
+  ],
+  "calibrated_model": {
+    "base_fault_us": 2.5625,
+    "note": "本机实测缺页复制停顿中位数，仿真在本机档位用此值；Linux 4KiB 档位保留默认 8us 典型值"
+  },
+  "mean_page_count_error_pct": 0.0
+}

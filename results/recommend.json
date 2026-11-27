@@ -1,0 +1,262 @@
+{
+  "params": {
+    "ram_gib": 64.0,
+    "data_gib": 30.0,
+    "rate": 4000,
+    "snapshot_s": 180
+  },
+  "scenarios": {
+    "现状(THP开,高峰)": {
+      "workload": "uniform",
+      "huge_on": true,
+      "n_writes": 720000,
+      "copied_pages_peak": 9391636,
+      "copied_bytes_peak": 38468141056,
+      "footprint_peak_bytes": 76936282112,
+      "fork_stall_ms": 143.30499267578125,
+      "p50_us": 1664.7376319959642,
+      "p99_us": 9487.329853103442,
+      "p999_us": 14125.297109164927,
+      "p9999_us": 18747.3411581719,
+      "max_us": 27731.63012327145,
+      "fault_request_pct": 7.115138888888889,
+      "oom": true,
+      "oom_at_s": 8.0
+    },
+    "A:关THP": {
+      "workload": "uniform",
+      "huge_on": false,
+      "n_writes": 720000,
+      "copied_pages_peak": 693172,
+      "copied_bytes_peak": 2839232512,
+      "footprint_peak_bytes": 41307373568,
+      "fork_stall_ms": 358.2624816894531,
+      "p50_us": 273.009799928077,
+      "p99_us": 848.6339841323525,
+      "p999_us": 1228.4217249129895,
+      "p9999_us": 1649.2874482067512,
+      "max_us": 2876.6475093731665,
+      "fault_request_pct": 96.26666666666667,
+      "oom": false,
+      "oom_at_s": null
+    },
+    "B:A+低峰快照(速率减半)": {
+      "workload": "uniform",
+      "huge_on": false,
+      "n_writes": 359535,
+      "copied_pages_peak": 352834,
+      "copied_bytes_peak": 1445208064,
+      "footprint_peak_bytes": 39913349120,
+      "fork_stall_ms": 358.2624816894531,
+      "p50_us": 273.3100048847815,
+      "p99_us": 847.7627025294162,
+      "p999_us": 1245.349188283581,
+      "p9999_us": 1646.5212528177187,
+      "max_us": 2529.261857158767,
+      "fault_request_pct": 98.06945081841823,
+      "oom": false,
+      "oom_at_s": null
+    },
+    "C:B+碎片治理": {
+      "workload": "uniform",
+      "huge_on": false,
+      "n_writes": 359535,
+      "copied_pages_peak": 352244,
+      "copied_bytes_peak": 1442791424,
+      "footprint_peak_bytes": 37329514496,
+      "fork_stall_ms": 334.22115325927734,
+      "p50_us": 273.2928932392213,
+      "p99_us": 847.7627025294162,
+      "p999_us": 1245.349188283581,
+      "p9999_us": 1646.5212528177187,
+      "max_us": 2529.261857158767,
+      "fault_request_pct": 97.9022904585089,
+      "oom": false,
+      "oom_at_s": null
+    },
+    "D:C+容量放到35GiB": {
+      "workload": "uniform",
+      "huge_on": false,
+      "n_writes": 359535,
+      "copied_pages_peak": 353367,
+      "copied_bytes_peak": 1447391232,
+      "footprint_peak_bytes": 43314147328,
+      "fork_stall_ms": 389.91455078125,
+      "p50_us": 273.3146161958277,
+      "p99_us": 847.7627025294162,
+      "p999_us": 1245.349188283581,
+      "p9999_us": 1646.5212528177187,
+      "max_us": 2529.261857158767,
+      "fault_request_pct": 98.2371674524038,
+      "oom": false,
+      "oom_at_s": null
+    }
+  },
+  "recommendations": [
+    {
+      "title": "快照放在写入低谷（最直接、收益最大）",
+      "detail": "COW 复制量 ≈ N(1-e^(-w·q/N))，w=速率×时长。速率减半，快照窗口内新复制页近似减半；配合把快照拆到从节点做，主库零 COW。",
+      "evidence": {
+        "copy_timing": {
+          "thp_on_t50_s": 3.2,
+          "thp_on_t90_s": 10.6,
+          "thp_off_t50_s": 1627.4,
+          "thp_off_t90_s": 5406.3,
+          "n_huge_containers": 18344,
+          "n_base_containers": 9391636
+        }
+      }
+    },
+    {
+      "title": "关闭透明大页（THP=never/madvise）",
+      "detail": "2MiB 大页把单次复制单位从 4KiB 放大 512 倍，随机小键写几乎必然 OOM；关 THP 后单次缺页停顿也从百微秒级降到个位数微秒。",
+      "evidence": {
+        "thp_on": {
+          "workload": "uniform",
+          "huge_on": true,
+          "n_writes": 720000,
+          "copied_pages_peak": 9391636,
+          "copied_bytes_peak": 38468141056,
+          "footprint_peak_bytes": 76936282112,
+          "fork_stall_ms": 143.30499267578125,
+          "p50_us": 1664.7376319959642,
+          "p99_us": 9487.329853103442,
+          "p999_us": 14125.297109164927,
+          "p9999_us": 18747.3411581719,
+          "max_us": 27731.63012327145,
+          "fault_request_pct": 7.115138888888889,
+          "oom": true,
+          "oom_at_s": 8.0
+        },
+        "thp_off": {
+          "workload": "uniform",
+          "huge_on": false,
+          "n_writes": 720000,
+          "copied_pages_peak": 693172,
+          "copied_bytes_peak": 2839232512,
+          "footprint_peak_bytes": 41307373568,
+          "fork_stall_ms": 358.2624816894531,
+          "p50_us": 273.009799928077,
+          "p99_us": 848.6339841323525,
+          "p999_us": 1228.4217249129895,
+          "p9999_us": 1649.2874482067512,
+          "max_us": 2876.6475093731665,
+          "fault_request_pct": 96.26666666666667,
+          "oom": false,
+          "oom_at_s": null
+        },
+        "copy_timing": {
+          "thp_on_t50_s": 3.2,
+          "thp_on_t90_s": 10.6,
+          "thp_off_t50_s": 1627.4,
+          "thp_off_t90_s": 5406.3,
+          "n_huge_containers": 18344,
+          "n_base_containers": 9391636
+        }
+      }
+    },
+    {
+      "title": "单机数据容量：关 THP 后可放到物理内存的 65%~70%，不必压到 30%",
+      "detail": "20GiB/64GiB(31%) 是 THP 开启下的自保值；关 THP + 低峰快照后，35GiB(55%) 仍留有充足安全边际。",
+      "evidence": {
+        "d35_gib_run": {
+          "workload": "uniform",
+          "huge_on": false,
+          "n_writes": 359535,
+          "copied_pages_peak": 353367,
+          "copied_bytes_peak": 1447391232,
+          "footprint_peak_bytes": 43314147328,
+          "fork_stall_ms": 389.91455078125,
+          "p50_us": 273.3146161958277,
+          "p99_us": 847.7627025294162,
+          "p999_us": 1245.349188283581,
+          "p9999_us": 1646.5212528177187,
+          "max_us": 2529.261857158767,
+          "fault_request_pct": 98.2371674524038,
+          "oom": false,
+          "oom_at_s": null
+        }
+      }
+    },
+    {
+      "title": "批量导入/大键写避开快照窗口，大键拆小",
+      "detail": "顺序写的复制曲线是严格线性、斜率最陡；大键一次跨多页，THP 下一个大键就能引爆整张大页。",
+      "evidence": {
+        "sequential_thp_on": {
+          "workload": "sequential",
+          "huge_on": true,
+          "n_writes": 720000,
+          "copied_pages_peak": 691329,
+          "copied_bytes_peak": 2831683584,
+          "footprint_peak_bytes": 41299824640,
+          "fork_stall_ms": 143.30499267578125,
+          "p50_us": 265.4792792471678,
+          "p99_us": 840.5314452708903,
+          "p999_us": 1220.461273077035,
+          "p9999_us": 1634.4869967415416,
+          "max_us": 2868.6475093731665,
+          "fault_request_pct": 0.19416666666666665,
+          "oom": false,
+          "oom_at_s": null
+        },
+        "sequential_thp_off": {
+          "workload": "sequential",
+          "huge_on": false,
+          "n_writes": 720000,
+          "copied_pages_peak": 690945,
+          "copied_bytes_peak": 2830110720,
+          "footprint_peak_bytes": 41298251776,
+          "fork_stall_ms": 358.2624816894531,
+          "p50_us": 272.835095901574,
+          "p99_us": 847.9512393848835,
+          "p999_us": 1227.816704406296,
+          "p9999_us": 1642.4869967415416,
+          "max_us": 2868.6475093731665,
+          "fault_request_pct": 95.96319444444444,
+          "oom": false,
+          "oom_at_s": null
+        }
+      }
+    },
+    {
+      "title": "定期低峰 rewrite 治理删除/过期空洞",
+      "detail": "空洞页已映射、fork 后被写一样复制；fill_fraction 0.85→0.95，同等写入下已映射基数缩小，复制字节等比下降。",
+      "evidence": {
+        "fill085": {
+          "workload": "uniform",
+          "huge_on": false,
+          "n_writes": 359535,
+          "copied_pages_peak": 352834,
+          "copied_bytes_peak": 1445208064,
+          "footprint_peak_bytes": 39913349120,
+          "fork_stall_ms": 358.2624816894531,
+          "p50_us": 273.3100048847815,
+          "p99_us": 847.7627025294162,
+          "p999_us": 1245.349188283581,
+          "p9999_us": 1646.5212528177187,
+          "max_us": 2529.261857158767,
+          "fault_request_pct": 98.06945081841823,
+          "oom": false,
+          "oom_at_s": null
+        },
+        "fill095": {
+          "workload": "uniform",
+          "huge_on": false,
+          "n_writes": 359535,
+          "copied_pages_peak": 352244,
+          "copied_bytes_peak": 1442791424,
+          "footprint_peak_bytes": 37329514496,
+          "fork_stall_ms": 334.22115325927734,
+          "p50_us": 273.2928932392213,
+          "p99_us": 847.7627025294162,
+          "p999_us": 1245.349188283581,
+          "p9999_us": 1646.5212528177187,
+          "max_us": 2529.261857158767,
+          "fault_request_pct": 97.9022904585089,
+          "oom": false,
+          "oom_at_s": null
+        }
+      }
+    }
+  ]
+}
